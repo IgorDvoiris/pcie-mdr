@@ -11,6 +11,8 @@
 
 #include <fstream>
 
+void getMotherboardPath(sdbusplus::bus_t& bus, std::string& motherboardPath);
+
 std::unordered_map<std::string, std::unique_ptr<PcieDevice>> pcieDevices;
 std::unique_ptr<sdbusplus::bus::match_t> motherboardConfigMatch;
 boost::asio::io_context io;
@@ -68,7 +70,7 @@ bool readDataFromFlash(MDRPCIeHeader* mdrHdr, uint8_t* data)
 }
 
 void updatePcieInfo(UpdateDBusData infoPcieDevs,
-                    const std::string& motherboardPath)
+                    const std::string motherboardPath)
 {
     pcieDevices.clear();
     uint32_t offset = 0;
@@ -126,105 +128,16 @@ void updatePcieInfo(UpdateDBusData infoPcieDevs,
     }
 }
 
-void getMotherboardPath(sdbusplus::bus_t& bus, const std::string& inventoryPath,
-                        std::string& motherboardPath)
+bool updateMappingsFromFile(sdbusplus::bus_t& bus)
 {
-    // By default, look for System interface on any system/board/* object
-    std::string mapperAncestorPath = inventoryPath;
-    std::string matchParentPath = inventoryPath + "/board/";
-    bool requireExactMatch = false;
-
-    if (inventoryPath != defaultInventoryPath)
-    {
-        std::filesystem::path path(inventoryPath);
-
-        // Search under parent to find exact match for self
-        mapperAncestorPath = path.parent_path().string();
-        matchParentPath = mapperAncestorPath;
-        requireExactMatch = true;
-    }
-
-    auto method = bus.new_method_call(mapperBusName, mapperPath,
-                                      mapperInterface, "GetSubTreePaths");
-    method.append(mapperAncestorPath);
-    method.append(0);
-    method.append(std::vector<std::string>({systemInterface}));
-
-    try
-    {
-        std::vector<std::string> paths;
-        sdbusplus::message_t reply = bus.call(method);
-        reply.read(paths);
-
-        size_t pathsCount = paths.size();
-        for (size_t i = 0; i < pathsCount; ++i)
-        {
-            if (requireExactMatch && (paths[i] != inventoryPath))
-            {
-                continue;
-            }
-
-            motherboardPath = std::move(paths[i]);
-            break;
-        }
-        if (motherboardPath.empty())
-        {
-            phosphor::logging::log<phosphor::logging::level::ERR>(
-                "Failed to get system motherboard dbus path. Setting up a "
-                "match rule");
-
-            if (!motherboardConfigMatch)
-            {
-                motherboardConfigMatch =
-                    std::make_unique<sdbusplus::bus::match_t>(
-                        bus,
-                        sdbusplus::bus::match::rules::interfacesAdded() +
-                            sdbusplus::bus::match::rules::argNpath(
-                                0, matchParentPath),
-                        [&](sdbusplus::message_t& msg) {
-                    sdbusplus::message::object_path objectName;
-                    boost::container::flat_map<
-                        std::string,
-                        boost::container::flat_map<
-                            std::string, std::variant<std::string, uint64_t>>>
-                        msgData;
-                    msg.read(objectName, msgData);
-                    if (msgData.contains(systemInterface))
-                    {
-                        getMotherboardPath(bus, inventoryPath, motherboardPath);
-                    }
-                });
-            }
-        }
-        else
-        {
-            lg2::info(
-                "Found Inventory anchor object for PCIe-MDR content {I}: {M}",
-                "I", inventoryPath, "M", motherboardPath);
-        }
-    }
-    catch (const sdbusplus::exception_t& e)
-    {
-        lg2::error(
-            "Exception while trying to find Inventory anchor object for PCIe-MDR content {I}: {E}",
-            "I", inventoryPath, "E", e.what());
-        phosphor::logging::log<phosphor::logging::level::ERR>(
-            "Failed to query system motherboard",
-            phosphor::logging::entry("ERROR=%s", e.what()));
-    }
-}
-
-bool updateMappingsFromFile(sdbusplus::bus_t& bus,
-                            const std::string& inventoryPath)
-{
-    std::string motherboardPath;
-    getMotherboardPath(bus, inventoryPath, motherboardPath);
-
     UpdateDBusData infoPcieDevs;
     infoPcieDevs.bus = &bus;
 
     phosphor::logging::log<phosphor::logging::level::INFO>(
         "updateMappingsFromFile");
+
+    std::string motherboardPath;
+    getMotherboardPath(bus, motherboardPath);
 
     bool status = readDataFromFlash(&infoPcieDevs.mdrHdr,
                                     infoPcieDevs.dataStorage);
@@ -242,6 +155,64 @@ bool updateMappingsFromFile(sdbusplus::bus_t& bus,
     return true;
 }
 
+void getMotherboardPath(sdbusplus::bus_t& bus, std::string& motherboardPath)
+{
+    auto method = bus.new_method_call(mapperBusName, mapperPath,
+                                      mapperInterface, "GetSubTreePaths");
+    method.append(defaultInventoryPath);
+    method.append(0);
+    method.append(std::vector<std::string>({systemInterface}));
+
+    try
+    {
+        std::vector<std::string> paths;
+        sdbusplus::message_t reply = bus.call(method);
+        reply.read(paths);
+        if (paths.size() != 0)
+        {
+            motherboardPath = std::move(paths[0]);
+            return;
+        }
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        // There might be a case when the interface is just created but
+        // ObjectMapper is unaware of this. Ignore this exception as
+        // a result of race conditions at system startup or reboot.
+        // Fallthrough to error case.
+    }
+
+    // Fallthrough in case of zero path.size() or d-bus exception:
+    // there is no need to specify a condition.
+
+    phosphor::logging::log<phosphor::logging::level::ERR>(
+        "Failed to get system motherboard dbus path. Setting up a "
+        "match rule");
+    // Add match rule if motherboard dbus path is not yet created
+    static std::unique_ptr<sdbusplus::bus::match_t> motherboardConfigMatch =
+        std::make_unique<sdbusplus::bus::match_t>(
+            bus,
+            sdbusplus::bus::match::rules::interfacesAdded() +
+                sdbusplus::bus::match::rules::argNpath(
+                    0, std::string(defaultInventoryPath) + "/chassis/"),
+            [&](sdbusplus::message_t& msg) {
+        sdbusplus::message::object_path objectName;
+        boost::container::flat_map<
+            std::string, boost::container::flat_map<
+                             std::string, std::variant<std::string, uint64_t>>>
+            msgData;
+        msg.read(objectName, msgData);
+        if (msgData.contains(systemInterface))
+        {
+            // There is a definition of the motherboard chassis:
+            // the only object which has Item.System interface.
+            // Get the motherboard path from the match message.
+            motherboardPath = objectName;
+            updateMappingsFromFile(bus);
+        }
+    });
+}
+
 int main(void)
 {
     auto connection = std::make_shared<sdbusplus::asio::connection>(io);
@@ -252,12 +223,11 @@ int main(void)
     bus.request_name(PCIeMdrV2Service);
     std::shared_ptr<sdbusplus::asio::dbus_interface> iface =
         objServer.add_interface(PCIeMdrV2Path, PCIeMdrV2Interface);
-    iface->register_method(PCIeMdrV2UpdateFunctionName, [&]() {
-        return updateMappingsFromFile(bus, defaultInventoryPath);
-    });
+    iface->register_method(PCIeMdrV2UpdateFunctionName,
+                           [&]() { return updateMappingsFromFile(bus); });
     iface->initialize();
 
-    updateMappingsFromFile(bus, defaultInventoryPath);
+    updateMappingsFromFile(bus);
 
     io.run();
 
