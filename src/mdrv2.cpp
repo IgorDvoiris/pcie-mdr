@@ -10,6 +10,8 @@
 
 #include <fstream>
 
+void getMotherboardPath(sdbusplus::bus_t& bus, std::string& motherboardPath);
+
 std::unordered_map<std::string, std::unique_ptr<PcieDevice>> pcieDevices;
 boost::asio::io_context io;
 
@@ -65,7 +67,8 @@ bool readDataFromFlash(MDRPCIeHeader* mdrHdr, uint8_t* data)
     return true;
 }
 
-void updatePcieInfo(UpdateDBusData infoPcieDevs)
+void updatePcieInfo(UpdateDBusData infoPcieDevs,
+                    const std::string motherboardPath)
 {
     pcieDevices.clear();
     uint32_t offset = 0;
@@ -131,6 +134,9 @@ bool updateMappingsFromFile(sdbusplus::bus_t& bus)
     phosphor::logging::log<phosphor::logging::level::INFO>(
         "updateMappingsFromFile");
 
+    std::string motherboardPath;
+    getMotherboardPath(bus, motherboardPath);
+
     bool status = readDataFromFlash(&infoPcieDevs.mdrHdr,
                                     infoPcieDevs.dataStorage);
     if (!status)
@@ -145,6 +151,64 @@ bool updateMappingsFromFile(sdbusplus::bus_t& bus)
 
     io.post(std::bind(updatePcieInfo, infoPcieDevs));
     return true;
+}
+
+void getMotherboardPath(sdbusplus::bus_t& bus, std::string& motherboardPath)
+{
+    auto method = bus.new_method_call(mapperBusName, mapperPath,
+                                      mapperInterface, "GetSubTreePaths");
+    method.append(defaultInventoryPath);
+    method.append(0);
+    method.append(std::vector<std::string>({systemInterface}));
+
+    try
+    {
+        std::vector<std::string> paths;
+        sdbusplus::message_t reply = bus.call(method);
+        reply.read(paths);
+        if (paths.size() != 0)
+        {
+            motherboardPath = std::move(paths[0]);
+            return;
+        }
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        // There might be a case when the interface is just created but
+        // ObjectMapper is unaware of this. Ignore this exception as
+        // a result of race conditions at system startup or reboot.
+        // Fallthrough to error case.
+    }
+
+    // Fallthrough in case of zero path.size() or d-bus exception:
+    // there is no need to specify a condition.
+
+    phosphor::logging::log<phosphor::logging::level::ERR>(
+        "Failed to get system motherboard dbus path. Setting up a "
+        "match rule");
+    // Add match rule if motherboard dbus path is not yet created
+    static std::unique_ptr<sdbusplus::bus::match_t> motherboardConfigMatch =
+        std::make_unique<sdbusplus::bus::match_t>(
+            bus,
+            sdbusplus::bus::match::rules::interfacesAdded() +
+                sdbusplus::bus::match::rules::argNpath(
+                    0, std::string(defaultInventoryPath) + "/chassis/"),
+            [&](sdbusplus::message_t& msg) {
+        sdbusplus::message::object_path objectName;
+        boost::container::flat_map<
+            std::string, boost::container::flat_map<
+                             std::string, std::variant<std::string, uint64_t>>>
+            msgData;
+        msg.read(objectName, msgData);
+        if (msgData.contains(systemInterface))
+        {
+            // There is a definition of the motherboard chassis:
+            // the only object which has Item.System interface.
+            // Get the motherboard path from the match message.
+            motherboardPath = objectName;
+            updateMappingsFromFile(bus);
+        }
+    });
 }
 
 int main(void)
